@@ -335,8 +335,40 @@ pub async fn create_scan_data(
         scan.flight_id,
     )
         .fetch_one(pool)
-        .await?;
-    Ok(new_scan)
+        .await;
+
+    // Handle constraint violation (race condition: two concurrent requests)
+    match new_scan {
+        Ok(scan_data) => Ok(scan_data),
+        Err(e) => {
+            if let sqlx::Error::Database(db_err) = &e {
+                if db_err.constraint() == Some("idx_unique_barcode_per_flight") {
+                    // Race condition occurred - another request inserted first
+                    // Fetch the existing scan to return proper 409 response
+                    let existing = sqlx::query_as!(
+                        ScanData,
+                        r#"
+                        SELECT id, barcode_value, barcode_format, scan_time, device_id, flight_id, created_at
+                        FROM scan_data
+                        WHERE barcode_value = $1 AND flight_id = $2
+                        LIMIT 1
+                        "#,
+                        scan.barcode_value,
+                        scan.flight_id,
+                    )
+                    .fetch_one(pool)
+                    .await?;
+
+                    return Err(AppError::DuplicateScan {
+                        barcode: scan.barcode_value,
+                        flight_id: scan.flight_id,
+                        existing_scan_id: existing.id,
+                    });
+                }
+            }
+            Err(AppError::DatabaseError(e))
+        }
+    }
 }
 
 // Fungsi untuk mengambil data scan dengan filter
